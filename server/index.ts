@@ -25,12 +25,15 @@ const app = express()
 const server = createServer(app)
 const port = Number(process.env.PORT ?? 3001)
 const production = process.env.NODE_ENV === 'production'
+const secureSessionCookies = process.env.SESSION_COOKIE_SECURE === undefined
+  ? production
+  : process.env.SESSION_COOKIE_SECURE.toLowerCase() === 'true'
 const sessionCookie = 'webos_session'
 const sessionLifetime = 7 * 24 * 60 * 60 * 1000
 const proxyTicketLifetime = 15 * 60 * 1000
 const proxyTicketSecret = randomBytes(32)
-const maxFileBytes = 1_000_000
-const maxProxyBytes = 5_000_000
+const maxFileBytes = 16_000_000_000
+const maxProxyBytes = 50_000_000
 const inviteCode = process.env.INVITE_CODE?.trim()
 
 interface User {
@@ -101,7 +104,7 @@ function createSession(res: Response, userId: number) {
   res.cookie(sessionCookie, token, {
     httpOnly: true,
     sameSite: 'strict',
-    secure: production,
+    secure: secureSessionCookies,
     maxAge: sessionLifetime,
     path: '/',
     priority: 'high',
@@ -137,7 +140,7 @@ function clearSessionCookie(res: Response) {
   res.clearCookie(sessionCookie, {
     httpOnly: true,
     sameSite: 'strict',
-    secure: production,
+    secure: secureSessionCookies,
     path: '/',
   })
 }
@@ -159,14 +162,7 @@ function parseFileId(value: unknown): number | undefined {
   return Number.isSafeInteger(id) ? id : undefined
 }
 
-function validateFileInput(body: unknown):
-  | { ok: true; name: string; content: string }
-  | { ok: false; error: string; status: 400 | 413 } {
-  const rawName = stringField(body, 'name')
-  const content = stringField(body, 'content')
-  if (rawName === undefined || content === undefined) {
-    return { ok: false, error: '文件名和内容必须是字符串', status: 400 }
-  }
+function validateFileName(rawName: string) {
   const name = rawName.trim()
   const hasControlCharacter = [...name].some((character) => {
     const code = character.codePointAt(0)!
@@ -180,11 +176,24 @@ function validateFileInput(body: unknown):
     || name === '.'
     || name === '..'
     || /[. ]$/.test(name)
-  ) {
+  ) return undefined
+  return name
+}
+
+function validateFileInput(body: unknown):
+  | { ok: true; name: string; content: string }
+  | { ok: false; error: string; status: 400 | 413 } {
+  const rawName = stringField(body, 'name')
+  const content = stringField(body, 'content')
+  if (rawName === undefined || content === undefined) {
+    return { ok: false, error: '文件名和内容必须是字符串', status: 400 }
+  }
+  const name = validateFileName(rawName)
+  if (!name) {
     return { ok: false, error: '文件名无效', status: 400 }
   }
   if (Buffer.byteLength(content, 'utf8') > maxFileBytes) {
-    return { ok: false, error: '文件不能超过 1 MB', status: 413 }
+    return { ok: false, error: '文件不能超过 16 GB', status: 413 }
   }
   return { ok: true, name, content }
 }
@@ -196,8 +205,8 @@ function isUniqueConstraint(error: unknown) {
 
 function getFile(userId: number, id: number) {
   return db.prepare(`
-    SELECT id, name, content, mime_type AS mimeType,
-      length(CAST(content AS BLOB)) AS sizeBytes, updated_at AS updatedAt
+    SELECT id, name, content, mime_type AS mimeType, encoding,
+      size_bytes AS sizeBytes, updated_at AS updatedAt
     FROM files WHERE id = ? AND user_id = ?
   `).get(id, userId)
 }
@@ -316,10 +325,41 @@ app.post('/api/auth/logout', (req, res) => {
 app.get('/api/files', requireAuth, (req, res) => {
   const files = db.prepare(
     `SELECT id, name, mime_type AS mimeType,
-      length(CAST(content AS BLOB)) AS sizeBytes, updated_at AS updatedAt
+      size_bytes AS sizeBytes, updated_at AS updatedAt
     FROM files WHERE user_id = ? ORDER BY name`,
   ).all(req.user!.id)
   res.json({ files })
+})
+
+app.post('/api/files/upload', requireAuth, (req, res) => {
+  const rawName = stringField(req.body, 'name')
+  const data = stringField(req.body, 'data')
+  const mimeType = stringField(req.body, 'mimeType')?.slice(0, 255) || 'application/octet-stream'
+  const name = rawName === undefined ? undefined : validateFileName(rawName)
+  if (!name || data === undefined || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)) {
+    res.status(400).json({ error: '上传文件数据无效' })
+    return
+  }
+  const sizeBytes = Buffer.byteLength(data, 'base64')
+  if (sizeBytes > maxFileBytes) {
+    res.status(413).json({ error: '文件不能超过 16 GB' })
+    return
+  }
+  try {
+    const result = db.prepare(
+      `INSERT INTO files (user_id, name, content, mime_type, encoding, size_bytes)
+      VALUES (?, ?, ?, ?, 'base64', ?)`,
+    ).run(req.user!.id, name, data, mimeType, sizeBytes)
+    const file = getFile(req.user!.id, Number(result.lastInsertRowid))
+    broadcast(req.user!.id, { type: 'file:changed', message: `已上传 ${name}` })
+    res.status(201).json({ file })
+  } catch (error) {
+    if (isUniqueConstraint(error)) {
+      res.status(409).json({ error: '同名文件已存在' })
+      return
+    }
+    throw error
+  }
 })
 
 app.get('/api/files/:id', requireAuth, (req, res) => {
@@ -334,6 +374,27 @@ app.get('/api/files/:id', requireAuth, (req, res) => {
     return
   }
   res.json({ file })
+})
+
+app.get('/api/files/:id/download', requireAuth, (req, res) => {
+  const id = parseFileId(req.params.id)
+  if (!id) {
+    res.status(400).json({ error: '文件 ID 无效' })
+    return
+  }
+  const file = db.prepare(`
+    SELECT name, content, mime_type AS mimeType, encoding
+    FROM files WHERE id = ? AND user_id = ?
+  `).get(id, req.user!.id) as { name: string; content: string; mimeType: string; encoding: string } | undefined
+  if (!file) {
+    res.status(404).json({ error: '文件不存在' })
+    return
+  }
+  const body = Buffer.from(file.content, file.encoding === 'base64' ? 'base64' : 'utf8')
+  res.attachment(file.name)
+  res.type(file.mimeType || 'application/octet-stream')
+  res.set('content-length', String(body.length))
+  res.send(body)
 })
 
 app.post('/api/files', requireAuth, (req, res) => {
@@ -389,7 +450,7 @@ app.put('/api/files/:id', requireAuth, (req, res) => {
       return
     }
     const result = db.prepare(
-      "UPDATE files SET name = ?, content = ?, size_bytes = ?, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = ? AND user_id = ?",
+      "UPDATE files SET name = ?, content = ?, encoding = 'utf8', size_bytes = ?, updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') WHERE id = ? AND user_id = ?",
     ).run(name, content, sizeBytes, id, req.user!.id)
     if (!result.changes) {
       res.status(404).json({ error: '文件不存在' })
