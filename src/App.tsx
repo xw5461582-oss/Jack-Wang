@@ -329,7 +329,7 @@ function FilesApp({ openFile, notify }: { openFile: (id: number) => void; notify
   async function upload(file: File) {
     setUploading(true)
     try {
-      if (file.size > 1_000_000) throw new Error('文件不能超过 1 MB')
+      if (file.size > 16_000_000_000) throw new Error('文件不能超过 16 GB')
       const content = await file.text()
       await api.createFile(file.name, content)
       await load()
