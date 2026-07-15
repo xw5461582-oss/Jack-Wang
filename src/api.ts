@@ -9,6 +9,7 @@ export interface CloudFile {
   name: string
   content?: string
   mimeType?: string
+  encoding?: string
   sizeBytes?: number
   updatedAt?: string
 }
@@ -34,6 +35,15 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function requestBlob(path: string) {
+  const response = await fetch(path)
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ error: '下载失败' })) as { error?: string }
+    throw new Error(body.error ?? '下载失败')
+  }
+  return response.blob()
+}
+
 export const api = {
   me: () => request<{ user: User }>('/api/auth/me'),
   login: (username: string, password: string) =>
@@ -57,6 +67,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ name, content }),
     }),
+  uploadFile: (name: string, mimeType: string, data: string) =>
+    request<{ file: CloudFile }>('/api/files/upload', {
+      method: 'POST',
+      body: JSON.stringify({ name, mimeType, data }),
+    }),
+  downloadFile: (id: number) => requestBlob(`/api/files/${id}/download`),
   updateFile: (file: Pick<CloudFile, 'id' | 'name' | 'content'>) =>
     request<{ file: CloudFile }>(`/api/files/${file.id}`, {
       method: 'PUT',
