@@ -23,7 +23,7 @@ import { closeDatabase, db } from './db.js'
 const scrypt = promisify(scryptCallback)
 const app = express()
 const server = createServer(app)
-const port = Number(process.env.PORT ?? 3001)
+const port = Number(process.env.PORT ?? 8000)
 const production = process.env.NODE_ENV === 'production'
 const secureSessionCookies = process.env.SESSION_COOKIE_SECURE === undefined
   ? production
