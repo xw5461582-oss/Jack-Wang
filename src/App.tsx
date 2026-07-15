@@ -39,6 +39,32 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 ** 2).toFixed(2)} MB`
 }
 
+function readFileAsBase64(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error('无法读取文件'))
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : ''
+      const separator = result.indexOf(',')
+      if (separator >= 0) resolve(result.slice(separator + 1))
+      else reject(new Error('文件数据无效'))
+    }
+    reader.readAsDataURL(file)
+  })
+}
+
+function isEditableCloudFile(file: CloudFile) {
+  return file.mimeType?.startsWith('text/')
+    || /\.(?:txt|md|json|csv|xml|ya?ml|log|html?|css|js|jsx|ts|tsx|py|java|c|cpp|h|cs|go|rs|php|vue|svelte|sql|sh)$/i.test(file.name)
+}
+
+function cloudFileContent(file: CloudFile) {
+  if (file.encoding !== 'base64') return file.content ?? ''
+  const binary = atob(file.content ?? '')
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0))
+  return new TextDecoder().decode(bytes)
+}
+
 function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: User) => void }) {
   const [mode, setMode] = useState<'login' | 'register'>('login')
   const [username, setUsername] = useState('')
@@ -197,7 +223,7 @@ function NotesApp({ notify }: { notify: (message: string, kind?: Notice['kind'])
       const { file } = await api.file(id)
       setSelected(file.id)
       setName(file.name)
-      setContent(file.content ?? '')
+      setContent(cloudFileContent(file))
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : '文件加载失败')
     } finally {
@@ -306,6 +332,7 @@ function FilesApp({ openFile, notify }: { openFile: (id: number) => void; notify
   const [files, setFiles] = useState<CloudFile[]>([])
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
+  const [downloading, setDownloading] = useState<number | null>(null)
   const [error, setError] = useState('')
   const uploadInput = useRef<HTMLInputElement>(null)
   const totalBytes = files.reduce((total, file) => total + (file.sizeBytes ?? 0), 0)
@@ -330,8 +357,8 @@ function FilesApp({ openFile, notify }: { openFile: (id: number) => void; notify
     setUploading(true)
     try {
       if (file.size > 16_000_000_000) throw new Error('文件不能超过 16 GB')
-      const content = await file.text()
-      await api.createFile(file.name, content)
+      const data = await readFileAsBase64(file)
+      await api.uploadFile(file.name, file.type || 'application/octet-stream', data)
       await load()
       notify(`已上传 ${file.name}`, 'success')
     } catch (cause) {
@@ -340,6 +367,24 @@ function FilesApp({ openFile, notify }: { openFile: (id: number) => void; notify
       setUploading(false)
       if (uploadInput.current) uploadInput.current.value = ''
     }
+  }
+
+  async function download(file: CloudFile) {
+    setDownloading(file.id)
+    try {
+      const blob = await api.downloadFile(file.id)
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = file.name
+      document.body.append(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+      notify(`已下载 ${file.name}`, 'success')
+    } catch (cause) {
+      notify(cause instanceof Error ? cause.message : '下载失败', 'error')
+    } finally { setDownloading(null) }
   }
 
   return (
@@ -358,7 +403,6 @@ function FilesApp({ openFile, notify }: { openFile: (id: number) => void; notify
             <input
               ref={uploadInput}
               type="file"
-              accept="text/*,.md,.json,.csv,.xml,.yaml,.yml,.log"
               hidden
               onChange={(event) => {
                 const file = event.target.files?.[0]
@@ -374,10 +418,10 @@ function FilesApp({ openFile, notify }: { openFile: (id: number) => void; notify
         {loading ? <div className="state-panel"><span className="spinner dark" /> 正在读取云盘</div>
           : error ? <div className="state-panel"><strong>无法打开云盘</strong><p>{error}</p><button onClick={() => void load()}>重试</button></div>
             : <div className="file-grid">{files.map((file) => (
-              <article key={file.id} onDoubleClick={() => openFile(file.id)}>
+              <article key={file.id} onDoubleClick={() => isEditableCloudFile(file) ? openFile(file.id) : void download(file)}>
                 <div className="big-file">▤</div><strong>{file.name}</strong>
-                <small>{file.updatedAt ? new Date(file.updatedAt).toLocaleString('zh-CN', { month: 'short', day: 'numeric' }) : '文本文件'}</small>
-                <div className="file-actions"><button onClick={() => openFile(file.id)}>打开</button><button aria-label={`删除 ${file.name}`} onClick={() => void remove(file.id)}>×</button></div>
+                <small>{file.sizeBytes !== undefined ? formatBytes(file.sizeBytes) : file.updatedAt ? new Date(file.updatedAt).toLocaleString('zh-CN', { month: 'short', day: 'numeric' }) : '云端文件'}</small>
+                <div className="file-actions">{isEditableCloudFile(file) && <button onClick={() => openFile(file.id)}>打开</button>}<button disabled={downloading === file.id} onClick={() => void download(file)}>{downloading === file.id ? '下载中' : '下载'}</button><button aria-label={`删除 ${file.name}`} onClick={() => void remove(file.id)}>×</button></div>
               </article>
             ))}{!files.length && <div className="state-panel"><strong>云盘空空如也</strong><p>在记事本中创建第一个文件吧。</p></div>}</div>}
       </section>
@@ -525,7 +569,7 @@ function CodeEditorApp({ notify }: { notify: (message: string, kind?: Notice['ki
     if (tabs.some((tab) => programFileKey(tab) === key)) { setActiveKey(key); return }
     try {
       const result = await api.file(file.id)
-      const opened = { id: result.file.id, name: result.file.name, content: result.file.content ?? '' }
+      const opened = { id: result.file.id, name: result.file.name, content: cloudFileContent(result.file) }
       setTabs((items) => [...items, opened])
       setActiveKey(programFileKey(opened))
     } catch (cause) { notify(cause instanceof Error ? cause.message : '文件打开失败', 'error') }
